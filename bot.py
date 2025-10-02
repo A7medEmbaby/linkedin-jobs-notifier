@@ -105,7 +105,7 @@ async def get_new_roles_postings_task():
         blacklist = set(config["blacklist"])
 
         roles = scraper.get_recent_roles()
-        await DEBUG_CHANNEL.send("Number of non-sponsored roles:", len(roles))
+        await DEBUG_CHANNEL.send(f"Number of non-sponsored roles: {len(roles)}")
 
         companies = set()
         for role in roles:
@@ -137,7 +137,7 @@ async def get_new_roles_postings_task():
             await send_new_roles()
             await DEBUG_CHANNEL.send('Succeeded. Waiting 20 minutes.')
         except Exception as e:
-            await DEBUG_CHANNEL.send('Failed. Waiting 20 minutes.')
+            await DEBUG_CHANNEL.send(f'Failed: {str(e)}\nWaiting 20 minutes.')
             print(e)
         await asyncio.sleep(60 * 20)
 
