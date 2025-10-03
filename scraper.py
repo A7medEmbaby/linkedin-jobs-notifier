@@ -17,6 +17,14 @@ SELENIUM_USER_DATA_DIR = os.getenv('SELENIUM_USER_DATA_DIR')
 def get_recent_roles():
     options = Options()
     options.add_argument(f"user-data-dir={SELENIUM_USER_DATA_DIR}")
+    
+    # Add headless mode - browser runs in background
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    
     driver = webdriver.Chrome(options=options, service=ChromeService(executable_path=ChromeDriverManager().install()))
 
     try:
