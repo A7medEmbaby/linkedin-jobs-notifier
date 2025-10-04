@@ -105,19 +105,40 @@ async def get_new_roles_postings_task():
         blacklist = set(config["blacklist"])
 
         roles = scraper.get_recent_roles()
-        await DEBUG_CHANNEL.send(f"Number of non-sponsored roles: {len(roles)}")
+        await DEBUG_CHANNEL.send(f"Number of non-sponsored roles found: {len(roles)}")
 
         companies = set()
+        new_roles_count = 0
+        
+        # Remove duplicates from roles before processing
+        unique_roles = []
+        seen_jobs = set()
+        
         for role in roles:
             company, title, link, picture = role
-
-            company_and_title = company + " - " + title
-            if company_and_title in posted or company in blacklist:
+            job_key = f"{company} - {title}"
+            
+            # Skip if already seen in current batch or previously posted
+            if job_key in seen_jobs or job_key in posted:
+                continue
+            
+            seen_jobs.add(job_key)
+            unique_roles.append(role)
+        
+        await DEBUG_CHANNEL.send(f"Unique roles after deduplication: {len(unique_roles)}")
+        
+        for role in unique_roles:
+            company, title, link, picture = role
+            company_and_title = f"{company} - {title}"
+            
+            # Double check against blacklist
+            if company in blacklist:
                 continue
 
             companies.add(company)
             config["posted"].append(company_and_title)
             posted.add(company_and_title)
+            new_roles_count += 1
 
             embed = discord.Embed(title=title, url=link, color=discord.Color.from_str("#378CCF"), timestamp=datetime.datetime.now())
             embed.set_author(name=company, url=get_google_url(company))
@@ -128,16 +149,17 @@ async def get_new_roles_postings_task():
         if companies:
             await send_companies_list(companies)
             save_config(config)
+            await DEBUG_CHANNEL.send(f"Posted {new_roles_count} new roles from {len(companies)} companies.")
         else:
             await DEBUG_CHANNEL.send("No new roles.")
 
     while True:
         try:
-            await DEBUG_CHANNEL.send('Trying to get new roles...')
+            await DEBUG_CHANNEL.send('Starting job search across all configured URLs...')
             await send_new_roles()
-            await DEBUG_CHANNEL.send('Succeeded. Waiting 20 minutes.')
+            await DEBUG_CHANNEL.send('Search completed. Waiting 20 minutes.')
         except Exception as e:
-            await DEBUG_CHANNEL.send(f'Failed: {str(e)}\nWaiting 20 minutes.')
+            await DEBUG_CHANNEL.send(f'Failed: {str(e)}\nWaiting 20 minutes before retry.')
             print(e)
         await asyncio.sleep(60 * 20)
 
