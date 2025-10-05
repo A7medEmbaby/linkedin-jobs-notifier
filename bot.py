@@ -1,5 +1,6 @@
 import discord, asyncio
 import scraper
+import wuzzuf_scraper
 import os, sys, json
 import urllib.parse
 import datetime
@@ -11,6 +12,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 NEW_POSTINGS_CHANNEL_ID = int(os.getenv('NEW_POSTINGS_CHANNEL_ID'))
 DEBUG_CHANNEL_ID = int(os.getenv('DEBUG_CHANNEL_ID'))
 COMPANIES_CHANNEL_ID = int(os.getenv('COMPANIES_CHANNEL_ID'))
+WUZZUF_URL = os.getenv('WUZZUF_URL', '')
 
 # Instantiated after bot is logged in
 NEW_POSTINGS_CHANNEL = None
@@ -104,8 +106,21 @@ async def get_new_roles_postings_task():
         posted = set(config["posted"])
         blacklist = set(config["blacklist"])
 
-        roles = scraper.get_recent_roles()
-        await DEBUG_CHANNEL.send(f"Number of non-sponsored roles found: {len(roles)}")
+        # Scrape LinkedIn
+        await DEBUG_CHANNEL.send('Scraping LinkedIn...')
+        linkedin_roles = scraper.get_recent_roles()
+        await DEBUG_CHANNEL.send(f"LinkedIn: {len(linkedin_roles)} non-sponsored roles found")
+
+        # Scrape Wuzzuf if configured
+        wuzzuf_roles = []
+        if WUZZUF_URL:
+            await DEBUG_CHANNEL.send('Scraping Wuzzuf...')
+            wuzzuf_roles = wuzzuf_scraper.get_wuzzuf_roles()
+            await DEBUG_CHANNEL.send(f"Wuzzuf: {len(wuzzuf_roles)} roles found")
+        
+        # Combine roles from both sources
+        all_roles = linkedin_roles + wuzzuf_roles
+        await DEBUG_CHANNEL.send(f"Total roles from all sources: {len(all_roles)}")
 
         companies = set()
         new_roles_count = 0
@@ -114,7 +129,7 @@ async def get_new_roles_postings_task():
         unique_roles = []
         seen_jobs = set()
         
-        for role in roles:
+        for role in all_roles:
             company, title, link, picture = role
             job_key = f"{company} - {title}"
             
@@ -140,9 +155,13 @@ async def get_new_roles_postings_task():
             posted.add(company_and_title)
             new_roles_count += 1
 
+            # Determine source from link
+            source = "Wuzzuf" if "wuzzuf.net" in link else "LinkedIn"
+            
             embed = discord.Embed(title=title, url=link, color=discord.Color.from_str("#378CCF"), timestamp=datetime.datetime.now())
             embed.set_author(name=company, url=get_google_url(company))
-            embed.add_field(name="Levels.fyi Link", value=f"[{company} at Levels.fyi]({get_levels_url(company)})")
+            embed.add_field(name="Source", value=source, inline=True)
+            embed.add_field(name="Levels.fyi Link", value=f"[{company} at Levels.fyi]({get_levels_url(company)})", inline=False)
             embed.set_thumbnail(url=picture)
             await NEW_POSTINGS_CHANNEL.send(embed=embed)
         
@@ -155,7 +174,7 @@ async def get_new_roles_postings_task():
 
     while True:
         try:
-            await DEBUG_CHANNEL.send('Starting job search across all configured URLs...')
+            await DEBUG_CHANNEL.send('Starting job search across all configured sources...')
             await send_new_roles()
             await DEBUG_CHANNEL.send('Search completed. Waiting 20 minutes.')
         except Exception as e:
