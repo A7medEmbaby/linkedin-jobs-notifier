@@ -9,6 +9,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
 import os, time, json, re
+import logging
+
+# Suppress Selenium and WebDriver Manager logs
+logging.getLogger('selenium').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('WDM').setLevel(logging.WARNING)
 
 load_dotenv()
 LINKEDIN_URL = os.getenv('LINKEDIN_URL')
@@ -40,8 +46,13 @@ def init_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--log-level=3")  # Suppress console logs
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])  # Disable DevTools logs
     
-    return webdriver.Chrome(options=options, service=ChromeService(executable_path=ChromeDriverManager().install()))
+    service = ChromeService(executable_path=ChromeDriverManager().install())
+    service.log_path = os.devnull  # Suppress service logs
+    
+    return webdriver.Chrome(options=options, service=service)
 
 def check_keywords_in_text(text, return_details=False):
     """Check if any of the .NET keywords exist in the text"""
@@ -73,8 +84,7 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
     """Get job description from job details page"""
     try:
         if show_details:
-            print(f"\nChecking: {job_title} at {company_name}")
-            print(f"Link: {job_url}")
+            print(f"  Checking: {job_title} at {company_name}")
         
         driver.get(job_url)
         time.sleep(4)
@@ -132,49 +142,35 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
             return_details=True
         )
         
-        if show_details:
-            if found:
-                print(f"FOUND keywords: {', '.join(matched_keywords[:5])}")
-                print(f"\nFirst 500 chars of description:")
-                print("-" * 70)
-                print(description_text[:500])
-                print("-" * 70)
-            else:
-                print(f"NO keywords found")
-                print(f"\nFirst 300 chars (for review):")
-                print("-" * 70)
-                print(description_text[:300])
-                print("-" * 70)
+        if show_details and found:
+            print(f"    ✓ Found keywords: {', '.join(matched_keywords[:5])}")
         
         return description_text
         
     except Exception as e:
         if show_details:
-            print(f"Error: {str(e)}")
+            print(f"    ✗ Error: {str(e)}")
         return ""
 
 def parse_job_listings(driver, positions, check_keywords=False, show_details=False):
     """Parse job listings and return roles"""
     roles = []
-    skipped_promoted = 0
     skipped_no_keywords = 0
+    promoted_included = 0
     
     for position in positions:
         try:
-            # Check if promoted
+            # Check if promoted (but don't skip - just track for statistics)
             promoted = False
             try:
                 footer_items = position.find_elements(By.CSS_SELECTOR, ".job-card-container__footer-item")
                 for item in footer_items:
                     if "promoted" in item.text.lower():
                         promoted = True
+                        promoted_included += 1
                         break
             except:
                 pass
-            
-            if promoted:
-                skipped_promoted += 1
-                continue
 
             # Get company name
             company = None
@@ -258,13 +254,18 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
         except Exception as e:
             continue
     
-    print(f"Processed: {len(positions)} jobs | Promoted: {skipped_promoted} | No keywords: {skipped_no_keywords} | Added: {len(roles)}")
+    if not show_details:
+        # Simple summary
+        summary = f"  Found {len(roles)} jobs"
+        if promoted_included > 0:
+            summary += f" ({promoted_included} promoted)"
+        if skipped_no_keywords > 0:
+            summary += f", skipped {skipped_no_keywords}"
+        print(summary)
+    else:
+        print(f"  Processed: {len(positions)} | Promoted: {promoted_included} | Skipped: {skipped_no_keywords} | Added: {len(roles)}")
     
     return roles
-
-def click_next_page(driver):
-    """This function is no longer used - kept for compatibility"""
-    return False
 
 def scrape_url(url, check_keywords=False, show_details=False):
     """Scrape a single LinkedIn URL with pagination"""
@@ -272,38 +273,36 @@ def scrape_url(url, check_keywords=False, show_details=False):
     all_roles = []
     
     try:
-        # Parse the base URL
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        
-        print(f"Opening URL: {url}")
         
         # Check if logged in by visiting first
         driver.get(url)
         time.sleep(10)
         
         if "login" in driver.current_url.lower() or "authwall" in driver.current_url.lower():
-            print("ERROR: Not logged in! Run: python log_in_to_linkedin.py")
+            print("  ✗ Not logged in! Run: python log_in_to_linkedin.py")
             driver.quit()
             return []
 
         page_number = 1
-        jobs_per_page = 25  # LinkedIn shows 25 jobs per page
-        max_pages = 10  # Safety limit
+        jobs_per_page = 25
+        max_pages = 10
         
         while page_number <= max_pages:
-            print(f"\n--- Page {page_number} ---")
+            if not show_details:
+                print(f"  Page {page_number}...", end=" ")
+            else:
+                print(f"\n  --- Page {page_number} ---")
             
             # Build URL for current page
             parsed_url = urlparse(url)
             query_params = parse_qs(parsed_url.query)
             
-            # Add or update start parameter
             if page_number > 1:
                 query_params['start'] = [(page_number - 1) * jobs_per_page]
             elif 'start' in query_params:
                 del query_params['start']
             
-            # Rebuild URL
             new_query = urlencode(query_params, doseq=True)
             page_url = urlunparse((
                 parsed_url.scheme,
@@ -314,7 +313,6 @@ def scrape_url(url, check_keywords=False, show_details=False):
                 parsed_url.fragment
             ))
             
-            # Navigate to page (skip if first page, already loaded)
             if page_number > 1:
                 driver.get(page_url)
                 time.sleep(5)
@@ -329,11 +327,13 @@ def scrape_url(url, check_keywords=False, show_details=False):
             for selector in selectors:
                 positions = driver.find_elements(By.CSS_SELECTOR, selector)
                 if positions:
-                    print(f"Found {len(positions)} job listings")
                     break
             
             if not positions:
-                print("No jobs found on this page")
+                if not show_details:
+                    print("No jobs")
+                else:
+                    print("  No jobs found")
                 break
 
             # Scroll to load all jobs on current page
@@ -350,19 +350,20 @@ def scrape_url(url, check_keywords=False, show_details=False):
             roles = parse_job_listings(driver, positions, check_keywords, show_details)
             all_roles.extend(roles)
             
-            # Check if there are more pages by looking at results count
             if len(positions) < jobs_per_page:
-                print(f"Last page reached (only {len(positions)} jobs found)")
+                if not show_details and page_number > 1:
+                    print()
                 break
             
             page_number += 1
         
-        print(f"Total jobs from all pages: {len(all_roles)}")
+        if not show_details:
+            print(f"\n  ✓ Total: {len(all_roles)} jobs")
+        else:
+            print(f"\n  Total from all pages: {len(all_roles)}")
         
     except Exception as e:
-        print(f"Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"  ✗ Error: {str(e)}")
     finally:
         driver.quit()
     
@@ -372,35 +373,32 @@ def get_recent_roles(show_details=False):
     """Get roles from all configured URLs"""
     all_roles = []
     
-    print("\n" + "="*80)
-    print("Starting job search...")
-    print("="*80 + "\n")
+    print("\n" + "="*60)
+    print("LinkedIn Job Search")
+    print("="*60)
     
-    # Scrape main URL (always without keyword filtering)
+    # Scrape main URL
     if LINKEDIN_URL:
-        print(">>> Main URL (no keyword filtering)")
-        roles = scrape_url(LINKEDIN_URL, check_keywords=False, show_details=False)
+        print("\n📋 Main Search (all jobs)")
+        roles = scrape_url(LINKEDIN_URL, check_keywords=False, show_details=show_details)
         all_roles.extend(roles)
-        print(f"Total from main URL: {len(roles)} jobs\n")
     
-    # Scrape additional URLs (optional, with keyword filtering)
+    # Scrape additional URLs with keyword filtering
     if LINKEDIN_KEYWORD_URLS and LINKEDIN_KEYWORD_URLS.strip():
         keyword_urls = [url.strip() for url in LINKEDIN_KEYWORD_URLS.split(',') if url.strip()]
         
         if keyword_urls:
             for i, url in enumerate(keyword_urls, 1):
-                print(f"\n>>> Keyword URL {i}/{len(keyword_urls)} (with .NET filtering)")
+                print(f"\n🔍 Keyword Search {i}/{len(keyword_urls)} (.NET filtered)")
                 roles = scrape_url(url, check_keywords=True, show_details=show_details)
                 all_roles.extend(roles)
-                print(f"Total from URL {i}: {len(roles)} .NET jobs")
                 
                 if i < len(keyword_urls):
-                    print("Waiting 5 seconds...")
                     time.sleep(5)
     
-    print("\n" + "="*80)
-    print(f"Search completed! Total jobs: {len(all_roles)}")
-    print("="*80 + "\n")
+    print("\n" + "="*60)
+    print(f"✓ Search Complete: {len(all_roles)} total jobs found")
+    print("="*60 + "\n")
     
     return all_roles
 
@@ -409,15 +407,8 @@ if __name__ == "__main__":
     
     show_details = "--details" in sys.argv or "-d" in sys.argv
     
-    if show_details:
-        print("Detailed mode enabled - will show job descriptions\n")
-    
     roles = get_recent_roles(show_details=show_details)
     
-    print("\nFinal Results:")
-    print("="*80)
-    print(json.dumps(roles, indent=2, ensure_ascii=False))
-    
-    if not show_details:
-        print("\nTip: Run with --details to see job descriptions")
-        print("Example: python scraper.py --details")
+    if show_details:
+        print("\nResults:")
+        print(json.dumps(roles, indent=2, ensure_ascii=False))

@@ -5,7 +5,19 @@ import os, sys, json
 import urllib.parse
 import datetime
 from dotenv import load_dotenv
-import json
+import logging
+
+# Configure logging to reduce Discord.py verbosity
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+
+# Set Discord logging to WARNING (only show warnings and errors)
+logging.getLogger('discord').setLevel(logging.WARNING)
+logging.getLogger('discord.gateway').setLevel(logging.ERROR)
+logging.getLogger('discord.http').setLevel(logging.WARNING)
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -27,8 +39,8 @@ bot = discord.Client(intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    print('------')
+    print(f'✓ Bot logged in as {bot.user.name}')
+    print('-' * 60)
 
     global NEW_POSTINGS_CHANNEL, DEBUG_CHANNEL, COMPANIES_CHANNEL
     NEW_POSTINGS_CHANNEL = bot.get_channel(NEW_POSTINGS_CHANNEL_ID)
@@ -106,26 +118,19 @@ async def get_new_roles_postings_task():
         posted = set(config["posted"])
         blacklist = set(config["blacklist"])
 
+        print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting job search...")
+        
         # Scrape LinkedIn
-        await DEBUG_CHANNEL.send('Scraping LinkedIn...')
         linkedin_roles = scraper.get_recent_roles()
-        await DEBUG_CHANNEL.send(f"LinkedIn: {len(linkedin_roles)} non-sponsored roles found")
 
         # Scrape Wuzzuf if configured
         wuzzuf_roles = []
         if WUZZUF_URL:
-            await DEBUG_CHANNEL.send('Scraping Wuzzuf...')
             wuzzuf_roles = wuzzuf_scraper.get_wuzzuf_roles()
-            await DEBUG_CHANNEL.send(f"Wuzzuf: {len(wuzzuf_roles)} roles found")
         
-        # Combine roles from both sources
+        # Combine and deduplicate
         all_roles = linkedin_roles + wuzzuf_roles
-        await DEBUG_CHANNEL.send(f"Total roles from all sources: {len(all_roles)}")
-
-        companies = set()
-        new_roles_count = 0
         
-        # Remove duplicates from roles before processing
         unique_roles = []
         seen_jobs = set()
         
@@ -133,20 +138,19 @@ async def get_new_roles_postings_task():
             company, title, link, picture = role
             job_key = f"{company} - {title}"
             
-            # Skip if already seen in current batch or previously posted
             if job_key in seen_jobs or job_key in posted:
                 continue
             
             seen_jobs.add(job_key)
             unique_roles.append(role)
         
-        await DEBUG_CHANNEL.send(f"Unique roles after deduplication: {len(unique_roles)}")
+        companies = set()
+        new_roles_count = 0
         
         for role in unique_roles:
             company, title, link, picture = role
             company_and_title = f"{company} - {title}"
             
-            # Double check against blacklist
             if company in blacklist:
                 continue
 
@@ -155,7 +159,6 @@ async def get_new_roles_postings_task():
             posted.add(company_and_title)
             new_roles_count += 1
 
-            # Determine source from link
             source = "Wuzzuf" if "wuzzuf.net" in link else "LinkedIn"
             
             embed = discord.Embed(title=title, url=link, color=discord.Color.from_str("#378CCF"), timestamp=datetime.datetime.now())
@@ -168,18 +171,21 @@ async def get_new_roles_postings_task():
         if companies:
             await send_companies_list(companies)
             save_config(config)
-            await DEBUG_CHANNEL.send(f"Posted {new_roles_count} new roles from {len(companies)} companies.")
+            print(f"✓ Posted {new_roles_count} new jobs from {len(companies)} companies\n")
+            await DEBUG_CHANNEL.send(f"✓ Posted {new_roles_count} new jobs from {len(companies)} companies")
         else:
-            await DEBUG_CHANNEL.send("No new roles.")
+            print(f"✓ No new jobs found\n")
+            await DEBUG_CHANNEL.send("No new jobs found")
 
     while True:
         try:
-            await DEBUG_CHANNEL.send('Starting job search across all configured sources...')
             await send_new_roles()
-            await DEBUG_CHANNEL.send('Search completed. Waiting 20 minutes.')
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Waiting 20 minutes...\n")
+            await DEBUG_CHANNEL.send('Waiting 20 minutes before next check...')
         except Exception as e:
-            await DEBUG_CHANNEL.send(f'Failed: {str(e)}\nWaiting 20 minutes before retry.')
-            print(e)
+            error_msg = f'Error occurred: {str(e)}'
+            print(f"✗ {error_msg}\n")
+            await DEBUG_CHANNEL.send(f'✗ {error_msg}\nRetrying in 20 minutes...')
         await asyncio.sleep(60 * 20)
 
 def get_config():
@@ -193,4 +199,6 @@ def save_config(config):
         json.dump(config, f, indent=4)
         f.truncate()
 
+print("Starting LinkedIn Jobs Notifier Bot...")
+print("=" * 60)
 bot.run(BOT_TOKEN)
