@@ -118,14 +118,22 @@ async def get_new_roles_postings_task():
         posted = set(config["posted"])
         blacklist = set(config["blacklist"])
 
-        print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] Starting job search...")
+        scrape_start_time = datetime.datetime.now()
+        print(f"\n{'='*60}")
+        print(f"[{scrape_start_time.strftime('%H:%M:%S')}] 🔍 Starting job search cycle...")
+        print(f"{'='*60}")
+        await DEBUG_CHANNEL.send(f"🔍 **Starting job search cycle** at {scrape_start_time.strftime('%H:%M:%S')}")
         
         # Scrape LinkedIn
+        print("Scraping LinkedIn...")
+        await DEBUG_CHANNEL.send("⏳ Scraping LinkedIn...")
         linkedin_roles = scraper.get_recent_roles()
 
         # Scrape Wuzzuf if configured
         wuzzuf_roles = []
         if WUZZUF_URL:
+            print("Scraping Wuzzuf...")
+            await DEBUG_CHANNEL.send("⏳ Scraping Wuzzuf...")
             wuzzuf_roles = wuzzuf_scraper.get_wuzzuf_roles()
         
         # Combine and deduplicate
@@ -168,25 +176,43 @@ async def get_new_roles_postings_task():
             embed.set_thumbnail(url=picture)
             await NEW_POSTINGS_CHANNEL.send(embed=embed)
         
+        scrape_end_time = datetime.datetime.now()
+        scrape_duration = (scrape_end_time - scrape_start_time).total_seconds()
+        
+        print(f"\n{'='*60}")
         if companies:
             await send_companies_list(companies)
             save_config(config)
-            print(f"✓ Posted {new_roles_count} new jobs from {len(companies)} companies\n")
-            await DEBUG_CHANNEL.send(f"✓ Posted {new_roles_count} new jobs from {len(companies)} companies")
+            print(f"✓ Posted {new_roles_count} new jobs from {len(companies)} companies")
+            print(f"⏱️  Scraping took {int(scrape_duration // 60)} minutes {int(scrape_duration % 60)} seconds")
+            await DEBUG_CHANNEL.send(f"✅ **Posted {new_roles_count} new jobs** from {len(companies)} companies\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
         else:
-            print(f"✓ No new jobs found\n")
-            await DEBUG_CHANNEL.send("No new jobs found")
+            print(f"✓ No new jobs found")
+            print(f"⏱️  Scraping took {int(scrape_duration // 60)} minutes {int(scrape_duration % 60)} seconds")
+            await DEBUG_CHANNEL.send(f"ℹ️ No new jobs found\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
+        
+        print(f"{'='*60}\n")
 
+    cycle_number = 0
     while True:
+        cycle_number += 1
         try:
             await send_new_roles()
-            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Waiting 20 minutes...\n")
-            await DEBUG_CHANNEL.send('Waiting 20 minutes before next check...')
+            
+            next_check_time = datetime.datetime.now() + datetime.timedelta(minutes=20)
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 😴 Waiting 20 minutes... (Cycle {cycle_number} complete)")
+            print(f"[Next check at {next_check_time.strftime('%H:%M:%S')}]\n")
+            await DEBUG_CHANNEL.send(f'😴 **Waiting 20 minutes** before next check...\n⏰ Next check at: {next_check_time.strftime("%H:%M:%S")}')
+            
+            await asyncio.sleep(60 * 20)  # Wait 20 minutes
+            
         except Exception as e:
             error_msg = f'Error occurred: {str(e)}'
-            print(f"✗ {error_msg}\n")
-            await DEBUG_CHANNEL.send(f'✗ {error_msg}\nRetrying in 20 minutes...')
-        await asyncio.sleep(60 * 20)
+            print(f"\n{'='*60}")
+            print(f"✗ {error_msg}")
+            print(f"{'='*60}\n")
+            await DEBUG_CHANNEL.send(f'❌ **Error occurred:** {error_msg}\n⏳ Retrying in 20 minutes...')
+            await asyncio.sleep(60 * 20)
 
 def get_config():
     with open(os.path.join(sys.path[0], 'config.json')) as f:
