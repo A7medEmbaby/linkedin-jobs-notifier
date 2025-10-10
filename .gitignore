@@ -2,3 +2,4 @@ __pycache__/
 .DS_Store
 .env
 config.json
+start_bot.bat
