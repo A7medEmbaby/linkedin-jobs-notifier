@@ -27,6 +27,9 @@ DEBUG_CHANNEL_ID = int(os.getenv('DEBUG_CHANNEL_ID'))
 COMPANIES_CHANNEL_ID = int(os.getenv('COMPANIES_CHANNEL_ID'))
 WUZZUF_URL = os.getenv('WUZZUF_URL', '')
 
+# Configuration: How many days to keep posted jobs in memory
+DAYS_TO_KEEP_JOBS = int(os.getenv('DAYS_TO_KEEP_JOBS', '7'))  # Default: 7 days
+
 # Instantiated after bot is logged in
 NEW_POSTINGS_CHANNEL = None
 DEBUG_CHANNEL = None
@@ -130,6 +133,41 @@ async def safe_send(channel, content=None, embed=None, max_retries=3):
                 print(f"⚠️  Failed to send message after {max_retries} attempts")
                 return None
 
+def clean_old_jobs(config):
+    """Remove jobs older than DAYS_TO_KEEP_JOBS from config"""
+    if "posted_with_timestamps" not in config:
+        # First time running with new format - migrate old data
+        config["posted_with_timestamps"] = {}
+        current_time = datetime.datetime.now().isoformat()
+        
+        # Migrate existing posted jobs with current timestamp
+        for job in config.get("posted", []):
+            config["posted_with_timestamps"][job] = current_time
+        
+        print(f"✓ Migrated {len(config['posted'])} jobs to timestamped format")
+    
+    # Calculate cutoff time
+    cutoff_time = datetime.datetime.now() - datetime.timedelta(days=DAYS_TO_KEEP_JOBS)
+    
+    # Filter out old jobs
+    jobs_before = len(config["posted_with_timestamps"])
+    config["posted_with_timestamps"] = {
+        job: timestamp 
+        for job, timestamp in config["posted_with_timestamps"].items()
+        if datetime.datetime.fromisoformat(timestamp) > cutoff_time
+    }
+    jobs_after = len(config["posted_with_timestamps"])
+    jobs_removed = jobs_before - jobs_after
+    
+    # Update the posted list (for backward compatibility)
+    config["posted"] = list(config["posted_with_timestamps"].keys())
+    
+    if jobs_removed > 0:
+        print(f"🗑️  Cleaned {jobs_removed} old jobs (older than {DAYS_TO_KEEP_JOBS} days)")
+        return jobs_removed
+    
+    return 0
+
 async def get_new_roles_postings_task():
     async def send_new_roles():
         async def send_companies_list(companies):
@@ -147,6 +185,13 @@ async def get_new_roles_postings_task():
             return base + urllib.parse.quote_plus(company)
 
         config = get_config()
+        
+        # Clean old jobs before scraping
+        jobs_removed = clean_old_jobs(config)
+        if jobs_removed > 0:
+            save_config(config)
+            await safe_send(DEBUG_CHANNEL, f"🗑️ **Cleaned {jobs_removed} old jobs** (older than {DAYS_TO_KEEP_JOBS} days)")
+        
         posted = set(config["posted"])
         blacklist = set(config["blacklist"])
 
@@ -186,6 +231,7 @@ async def get_new_roles_postings_task():
         
         companies = set()
         new_roles_count = 0
+        current_time = datetime.datetime.now().isoformat()
         
         for role in unique_roles:
             company, title, link, picture = role
@@ -195,7 +241,10 @@ async def get_new_roles_postings_task():
                 continue
 
             companies.add(company)
+            
+            # Add to posted list with timestamp
             config["posted"].append(company_and_title)
+            config["posted_with_timestamps"][company_and_title] = current_time
             posted.add(company_and_title)
             new_roles_count += 1
 
@@ -247,8 +296,26 @@ async def get_new_roles_postings_task():
             await asyncio.sleep(60 * 20)
 
 def get_config():
-    with open(os.path.join(sys.path[0], 'config.json')) as f:
+    config_path = os.path.join(sys.path[0], 'config.json')
+    
+    # Check if config exists, if not create default
+    if not os.path.exists(config_path):
+        default_config = {
+            "blacklist": [],
+            "posted": [],
+            "posted_with_timestamps": {}
+        }
+        with open(config_path, 'w') as f:
+            json.dump(default_config, f, indent=4)
+        return default_config
+    
+    with open(config_path) as f:
         config = json.load(f)
+        
+        # Ensure posted_with_timestamps exists
+        if "posted_with_timestamps" not in config:
+            config["posted_with_timestamps"] = {}
+        
         return config
 
 def save_config(config):
@@ -258,5 +325,7 @@ def save_config(config):
         f.truncate()
 
 print("Starting LinkedIn Jobs Notifier Bot...")
+print("=" * 60)
+print(f"⚙️  Jobs will be kept in memory for {DAYS_TO_KEEP_JOBS} days")
 print("=" * 60)
 bot.run(BOT_TOKEN, reconnect=True)
