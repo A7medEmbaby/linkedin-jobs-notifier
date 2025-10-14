@@ -25,10 +25,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 NEW_POSTINGS_CHANNEL_ID = int(os.getenv('NEW_POSTINGS_CHANNEL_ID'))
 DEBUG_CHANNEL_ID = int(os.getenv('DEBUG_CHANNEL_ID'))
 COMPANIES_CHANNEL_ID = int(os.getenv('COMPANIES_CHANNEL_ID'))
-WUZZUF_URL = os.getenv('WUZZUF_URL', '')
-
-# Configuration: How many days to keep posted jobs in memory
-DAYS_TO_KEEP_JOBS = int(os.getenv('DAYS_TO_KEEP_JOBS', '7'))  # Default: 7 days
+WUZZUF_URLS_UNFILTERED = os.getenv('WUZZUF_URLS_UNFILTERED', '')
+WUZZUF_URLS_FILTERED = os.getenv('WUZZUF_URLS_FILTERED', '')
 
 # Instantiated after bot is logged in
 NEW_POSTINGS_CHANNEL = None
@@ -133,41 +131,6 @@ async def safe_send(channel, content=None, embed=None, max_retries=3):
                 print(f"⚠️  Failed to send message after {max_retries} attempts")
                 return None
 
-def clean_old_jobs(config):
-    """Remove jobs older than DAYS_TO_KEEP_JOBS from config"""
-    if "posted_with_timestamps" not in config:
-        # First time running with new format - migrate old data
-        config["posted_with_timestamps"] = {}
-        current_time = datetime.datetime.now().isoformat()
-        
-        # Migrate existing posted jobs with current timestamp
-        for job in config.get("posted", []):
-            config["posted_with_timestamps"][job] = current_time
-        
-        print(f"✓ Migrated {len(config['posted'])} jobs to timestamped format")
-    
-    # Calculate cutoff time
-    cutoff_time = datetime.datetime.now() - datetime.timedelta(days=DAYS_TO_KEEP_JOBS)
-    
-    # Filter out old jobs
-    jobs_before = len(config["posted_with_timestamps"])
-    config["posted_with_timestamps"] = {
-        job: timestamp 
-        for job, timestamp in config["posted_with_timestamps"].items()
-        if datetime.datetime.fromisoformat(timestamp) > cutoff_time
-    }
-    jobs_after = len(config["posted_with_timestamps"])
-    jobs_removed = jobs_before - jobs_after
-    
-    # Update the posted list (for backward compatibility)
-    config["posted"] = list(config["posted_with_timestamps"].keys())
-    
-    if jobs_removed > 0:
-        print(f"🗑️  Cleaned {jobs_removed} old jobs (older than {DAYS_TO_KEEP_JOBS} days)")
-        return jobs_removed
-    
-    return 0
-
 async def get_new_roles_postings_task():
     async def send_new_roles():
         async def send_companies_list(companies):
@@ -176,22 +139,11 @@ async def get_new_roles_postings_task():
                 companies_list_string += company + "\n"
             await safe_send(COMPANIES_CHANNEL, companies_list_string)
 
-        def get_levels_url(company):
-            base = "https://www.levels.fyi/internships/?track=Software%20Engineer&timeframe=2023%20%2F%202022&search="
-            return base + urllib.parse.quote_plus(company)
-
         def get_google_url(company):
             base = "https://www.google.com/search?q="
             return base + urllib.parse.quote_plus(company)
 
         config = get_config()
-        
-        # Clean old jobs before scraping
-        jobs_removed = clean_old_jobs(config)
-        if jobs_removed > 0:
-            save_config(config)
-            await safe_send(DEBUG_CHANNEL, f"🗑️ **Cleaned {jobs_removed} old jobs** (older than {DAYS_TO_KEEP_JOBS} days)")
-        
         posted = set(config["posted"])
         blacklist = set(config["blacklist"])
 
@@ -201,61 +153,68 @@ async def get_new_roles_postings_task():
         print(f"{'='*60}")
         await safe_send(DEBUG_CHANNEL, f"🔍 **Starting job search cycle** at {scrape_start_time.strftime('%H:%M:%S')}")
         
-        # Scrape LinkedIn
+        # Scrape LinkedIn with detailed logging enabled
         print("Scraping LinkedIn...")
         await safe_send(DEBUG_CHANNEL, "⏳ Scraping LinkedIn...")
-        linkedin_roles = scraper.get_recent_roles()
+        linkedin_roles = scraper.get_recent_roles(show_details=True)
 
         # Scrape Wuzzuf if configured
         wuzzuf_roles = []
-        if WUZZUF_URL:
+        if WUZZUF_URLS_UNFILTERED or WUZZUF_URLS_FILTERED:
             print("Scraping Wuzzuf...")
             await safe_send(DEBUG_CHANNEL, "⏳ Scraping Wuzzuf...")
             wuzzuf_roles = wuzzuf_scraper.get_wuzzuf_roles()
         
-        # Combine and deduplicate
+        # Combine and process roles
         all_roles = linkedin_roles + wuzzuf_roles
+        print(f"--- Processing {len(all_roles)} total roles found ---")
         
-        unique_roles = []
-        seen_jobs = set()
+        unique_roles_to_post = []
+        seen_links = set()
         
         for role in all_roles:
-            company, title, link, picture = role
-            job_key = f"{company} - {title}"
+            company, title, link, picture, _ = role
             
-            if job_key in seen_jobs or job_key in posted:
+            # Skip if link is already processed in this batch
+            if link in seen_links:
+                print(f"  - Skipping (duplicate in this batch): {title} at {company}")
                 continue
-            
-            seen_jobs.add(job_key)
-            unique_roles.append(role)
-        
-        companies = set()
-        new_roles_count = 0
-        current_time = datetime.datetime.now().isoformat()
-        
-        for role in unique_roles:
-            company, title, link, picture = role
-            company_and_title = f"{company} - {title}"
-            
+            seen_links.add(link)
+
+            # Skip if link has been posted before
+            if link in posted:
+                print(f"  - Skipping (already posted): {title} at {company}")
+                continue
+
+            # Skip if company is in blacklist
             if company in blacklist:
+                print(f"  - Skipping (blacklisted company): {title} at {company}")
                 continue
-
-            companies.add(company)
             
-            # Add to posted list with timestamp
-            config["posted"].append(company_and_title)
-            config["posted_with_timestamps"][company_and_title] = current_time
-            posted.add(company_and_title)
-            new_roles_count += 1
+            print(f"  - ✓ Adding to post queue: {title} at {company}")
+            unique_roles_to_post.append(role)
+        
+        print(f"--- Found {len(unique_roles_to_post)} new, unique, non-blacklisted jobs to post ---")
 
-            source = "Wuzzuf" if "wuzzuf.net" in link else "LinkedIn"
-            
-            embed = discord.Embed(title=title, url=link, color=discord.Color.from_str("#378CCF"), timestamp=datetime.datetime.now())
-            embed.set_author(name=company, url=get_google_url(company))
-            embed.add_field(name="Source", value=source, inline=True)
-            embed.add_field(name="Levels.fyi Link", value=f"[{company} at Levels.fyi]({get_levels_url(company)})", inline=False)
-            embed.set_thumbnail(url=picture)
-            await safe_send(NEW_POSTINGS_CHANNEL, embed=embed)
+        companies = set()
+        if not unique_roles_to_post:
+            new_roles_count = 0
+        else:
+            new_roles_count = len(unique_roles_to_post)
+            for role in unique_roles_to_post:
+                company, title, link, picture, posted_time = role
+                companies.add(company)
+                config["posted"].append(link)
+                posted.add(link)
+
+                source = "Wuzzuf" if "wuzzuf.net" in link else "LinkedIn"
+                
+                embed = discord.Embed(title=title, url=link, color=discord.Color.from_str("#378CCF"), timestamp=datetime.datetime.now())
+                embed.set_author(name=company, url=get_google_url(company))
+                embed.add_field(name="Posted", value=posted_time, inline=True)
+                embed.add_field(name="Source", value=source, inline=True)
+                embed.set_thumbnail(url=picture)
+                await safe_send(NEW_POSTINGS_CHANNEL, embed=embed)
         
         scrape_end_time = datetime.datetime.now()
         scrape_duration = (scrape_end_time - scrape_start_time).total_seconds()
@@ -268,9 +227,9 @@ async def get_new_roles_postings_task():
             print(f"⏱️  Scraping took {int(scrape_duration // 60)} minutes {int(scrape_duration % 60)} seconds")
             await safe_send(DEBUG_CHANNEL, f"✅ **Posted {new_roles_count} new jobs** from {len(companies)} companies\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
         else:
-            print(f"✓ No new jobs found")
+            print(f"✓ No new jobs found to post")
             print(f"⏱️  Scraping took {int(scrape_duration // 60)} minutes {int(scrape_duration % 60)} seconds")
-            await safe_send(DEBUG_CHANNEL, f"ℹ️ No new jobs found\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
+            await safe_send(DEBUG_CHANNEL, f"ℹ️ No new jobs found to post\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
         
         print(f"{'='*60}\n")
 
@@ -282,8 +241,8 @@ async def get_new_roles_postings_task():
             
             next_check_time = datetime.datetime.now() + datetime.timedelta(minutes=20)
             print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 😴 Waiting 20 minutes... (Cycle {cycle_number} complete)")
-            print(f"[Next check at {next_check_time.strftime('%H:%M:%S')}]\n")
-            await safe_send(DEBUG_CHANNEL, f'😴 **Waiting 20 minutes** before next check...\n⏰ Next check at: {next_check_time.strftime("%H:%M:%S")}')
+            print(f"[Next check at {next_check_time.strftime('%H:%M:%S')}]\\n")
+            await safe_send(DEBUG_CHANNEL, f'😴 **Waiting 20 minutes** before next check...\\n⏰ Next check at: {next_check_time.strftime("%H:%M:%S")}')
             
             await asyncio.sleep(60 * 20)  # Wait 20 minutes
             
@@ -291,31 +250,13 @@ async def get_new_roles_postings_task():
             error_msg = f'Error occurred: {str(e)}'
             print(f"\n{'='*60}")
             print(f"✗ {error_msg}")
-            print(f"{'='*60}\n")
-            await safe_send(DEBUG_CHANNEL, f'❌ **Error occurred:** {error_msg}\n⏳ Retrying in 20 minutes...')
+            print(f"{'='*60}\\n")
+            await safe_send(DEBUG_CHANNEL, f'❌ **Error occurred:** {error_msg}\\n⏳ Retrying in 20 minutes...')
             await asyncio.sleep(60 * 20)
 
 def get_config():
-    config_path = os.path.join(sys.path[0], 'config.json')
-    
-    # Check if config exists, if not create default
-    if not os.path.exists(config_path):
-        default_config = {
-            "blacklist": [],
-            "posted": [],
-            "posted_with_timestamps": {}
-        }
-        with open(config_path, 'w') as f:
-            json.dump(default_config, f, indent=4)
-        return default_config
-    
-    with open(config_path) as f:
+    with open(os.path.join(sys.path[0], 'config.json')) as f:
         config = json.load(f)
-        
-        # Ensure posted_with_timestamps exists
-        if "posted_with_timestamps" not in config:
-            config["posted_with_timestamps"] = {}
-        
         return config
 
 def save_config(config):
@@ -325,7 +266,5 @@ def save_config(config):
         f.truncate()
 
 print("Starting LinkedIn Jobs Notifier Bot...")
-print("=" * 60)
-print(f"⚙️  Jobs will be kept in memory for {DAYS_TO_KEEP_JOBS} days")
 print("=" * 60)
 bot.run(BOT_TOKEN, reconnect=True)
