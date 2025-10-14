@@ -46,11 +46,11 @@ def init_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--log-level=3")  # Suppress console logs
-    options.add_experimental_option('excludeSwitches', ['enable-logging'])  # Disable DevTools logs
+    options.add_argument("--log-level=3")
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])
     
     service = ChromeService(executable_path=ChromeDriverManager().install())
-    service.log_path = os.devnull  # Suppress service logs
+    service.log_path = os.devnull
     
     return webdriver.Chrome(options=options, service=service)
 
@@ -152,69 +152,141 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
             print(f"    ✗ Error: {str(e)}")
         return ""
 
+def scroll_job_list_to_load_all(driver, show_details=False):
+    """Aggressively scroll the job list to load all lazy-loaded jobs"""
+    try:
+        # Find the scrollable container
+        scroll_container = driver.find_element(By.CSS_SELECTOR, ".jobs-search-results-list")
+        
+        # Get initial job count
+        initial_positions = driver.find_elements(By.CSS_SELECTOR, "li.scaffold-layout__list-item")
+        initial_count = len(initial_positions)
+        
+        if show_details:
+            print(f"    Initial jobs loaded: {initial_count}")
+        
+        max_scroll_attempts = 15
+        no_change_count = 0
+        previous_count = initial_count
+        
+        for attempt in range(max_scroll_attempts):
+            # Scroll to bottom of container
+            driver.execute_script(
+                "arguments[0].scrollTop = arguments[0].scrollHeight", 
+                scroll_container
+            )
+            
+            # Wait for content to load
+            time.sleep(2)
+            
+            # Check if new jobs loaded
+            current_positions = driver.find_elements(By.CSS_SELECTOR, "li.scaffold-layout__list-item")
+            current_count = len(current_positions)
+            
+            if show_details:
+                print(f"    Scroll {attempt + 1}: {current_count} jobs")
+            
+            if current_count == previous_count:
+                no_change_count += 1
+                if no_change_count >= 3:
+                    # No new jobs after 3 attempts, we're done
+                    if show_details:
+                        print(f"    ✓ All jobs loaded: {current_count} total")
+                    break
+            else:
+                no_change_count = 0
+                previous_count = current_count
+            
+            # Small scroll up and down to trigger lazy load
+            driver.execute_script("arguments[0].scrollTop -= 100", scroll_container)
+            time.sleep(0.5)
+        
+        # Final count
+        final_positions = driver.find_elements(By.CSS_SELECTOR, "li.scaffold-layout__list-item")
+        return final_positions
+        
+    except Exception as e:
+        if show_details:
+            print(f"    ⚠ Scroll error: {str(e)}")
+        # Return what we have
+        try:
+            return driver.find_elements(By.CSS_SELECTOR, "li.scaffold-layout__list-item")
+        except:
+            return []
+
 def parse_job_listings(driver, positions, check_keywords=False, show_details=False):
     """Parse job listings and return roles"""
     roles = []
     skipped_no_keywords = 0
-    promoted_included = 0
+    skipped_no_content = 0
     
-    for position in positions:
+    for idx, position in enumerate(positions, 1):
         try:
-            # Check if promoted (but don't skip - just track for statistics)
-            promoted = False
+            # Check if this is an empty placeholder (lazy load not completed)
             try:
-                footer_items = position.find_elements(By.CSS_SELECTOR, ".job-card-container__footer-item")
-                for item in footer_items:
-                    if "promoted" in item.text.lower():
-                        promoted = True
-                        promoted_included += 1
-                        break
+                # Check if the list item has actual content
+                job_card = position.find_element(By.CSS_SELECTOR, ".job-card-container")
+                if not job_card:
+                    skipped_no_content += 1
+                    continue
             except:
-                pass
+                # No job card found, skip this placeholder
+                skipped_no_content += 1
+                continue
 
-            # Get company name
+            # Get company name - FIXED SELECTORS
             company = None
             company_selectors = [
-                ".IDYXRdYkvwPmKlSknVlDfSjxIGwKrqEPWozBQIVw",
+                ".mhmxTfSoLgBKBPGgosykrrZdkyMULGNzPc",  # Updated to match HTML
                 ".artdeco-entity-lockup__subtitle",
-                ".job-card-container__primary-description"
+                ".job-card-container__primary-description",
+                "span[dir='ltr']"  # Fallback for company name in span
             ]
             
             for comp_sel in company_selectors:
                 try:
-                    company = position.find_element(By.CSS_SELECTOR, comp_sel).text.strip()
-                    if company:
+                    company_elem = position.find_element(By.CSS_SELECTOR, comp_sel)
+                    company = company_elem.text.strip()
+                    if company and len(company) > 0:
                         break
                 except:
                     continue
             
             if not company:
+                if show_details:
+                    print(f"    ⚠ Job {idx}: No company found")
                 continue
 
-            # Get job link
+            # Get job link - IMPROVED
             link = None
             link_selectors = [
                 "a.job-card-container__link",
-                "a[href*='/jobs/view/']"
+                "a[href*='/jobs/view/']",
+                ".job-card-list__title--link"
             ]
             
             for link_sel in link_selectors:
                 try:
                     link_element = position.find_element(By.CSS_SELECTOR, link_sel)
-                    link = link_element.get_attribute('href').split('?')[0]
+                    link = link_element.get_attribute('href')
                     if link:
+                        # Clean up the URL (remove tracking parameters)
+                        link = link.split('?')[0]
                         break
                 except:
                     continue
             
             if not link:
+                if show_details:
+                    print(f"    ⚠ Job {idx}: No link found for {company}")
                 continue
 
-            # Get job title
+            # Get job title - IMPROVED
             title = None
             title_selectors = [
                 "a.job-card-container__link strong",
-                ".job-card-container__link",
+                ".job-card-list__title--link strong",
+                "a.job-card-container__link",
                 ".artdeco-entity-lockup__title a"
             ]
             
@@ -222,12 +294,14 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
                 try:
                     title_element = position.find_element(By.CSS_SELECTOR, title_sel)
                     title = title_element.text.strip()
-                    if title:
+                    if title and len(title) > 0:
                         break
                 except:
                     continue
             
             if not title:
+                if show_details:
+                    print(f"    ⚠ Job {idx}: No title found for {company}")
                 continue
 
             # Check keywords if needed
@@ -239,7 +313,11 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
                 
                 if not found:
                     skipped_no_keywords += 1
+                    if show_details:
+                        print(f"    ✗ Job {idx}: {title} at {company} - No keywords")
                     continue
+                elif show_details:
+                    print(f"    ✓ Job {idx}: {title} at {company} - Keywords found")
 
             # Get company picture
             picture = None
@@ -251,19 +329,23 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
 
             roles.append((company, title, link, picture))
             
+            if show_details:
+                print(f"    ✓ Job {idx}: Added '{title}' at {company}")
+            
         except Exception as e:
+            if show_details:
+                print(f"    ✗ Job {idx}: Error - {str(e)}")
             continue
     
     if not show_details:
-        # Simple summary
         summary = f"  Found {len(roles)} jobs"
-        if promoted_included > 0:
-            summary += f" ({promoted_included} promoted)"
+        if skipped_no_content > 0:
+            summary += f" (skipped {skipped_no_content} empty placeholders)"
         if skipped_no_keywords > 0:
-            summary += f", skipped {skipped_no_keywords}"
+            summary += f", filtered out {skipped_no_keywords}"
         print(summary)
     else:
-        print(f"  Processed: {len(positions)} | Promoted: {promoted_included} | Skipped: {skipped_no_keywords} | Added: {len(roles)}")
+        print(f"  Processed: {len(positions)} | Empty: {skipped_no_content} | No Keywords: {skipped_no_keywords} | Added: {len(roles)}")
     
     return roles
 
@@ -275,7 +357,7 @@ def scrape_url(url, check_keywords=False, show_details=False):
     try:
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         
-        # Check if logged in by visiting first
+        # Check if logged in
         driver.get(url)
         time.sleep(10)
         
@@ -317,40 +399,23 @@ def scrape_url(url, check_keywords=False, show_details=False):
                 driver.get(page_url)
                 time.sleep(5)
             
-            # Find job listings
-            positions = []
-            selectors = [
-                "li.scaffold-layout__list-item",
-                "li[data-occludable-job-id]"
-            ]
+            # FIXED: Aggressively scroll to load ALL jobs
+            if show_details:
+                print("  Scrolling to load all jobs...")
+            positions = scroll_job_list_to_load_all(driver, show_details)
             
-            for selector in selectors:
-                positions = driver.find_elements(By.CSS_SELECTOR, selector)
-                if positions:
-                    break
-            
-            if not positions:
+            if not positions or len(positions) == 0:
                 if not show_details:
                     print("No jobs")
                 else:
                     print("  No jobs found")
                 break
 
-            # Scroll to load all jobs on current page
-            try:
-                scroll_container = driver.find_element(By.CSS_SELECTOR, ".jobs-search-results-list")
-                for i in range(3):
-                    driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scroll_container)
-                    time.sleep(1)
-                positions = driver.find_elements(By.CSS_SELECTOR, selector)
-            except:
-                pass
-
             # Parse job listings
             roles = parse_job_listings(driver, positions, check_keywords, show_details)
             all_roles.extend(roles)
             
-            if len(positions) < jobs_per_page:
+            if len(roles) < jobs_per_page:
                 if not show_details and page_number > 1:
                     print()
                 break
