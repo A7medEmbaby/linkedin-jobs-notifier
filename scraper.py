@@ -26,7 +26,6 @@ def load_keywords_from_env(env_var_name):
     keywords_str = os.getenv(env_var_name, '')
     if not keywords_str:
         return []
-    # Split by newline, strip whitespace, and filter out empty lines
     return [line.strip() for line in keywords_str.strip().splitlines() if line.strip()]
 
 JOB_KEYWORDS = load_keywords_from_env('JOB_KEYWORDS')
@@ -39,15 +38,12 @@ def parse_multiline_urls(url_string):
     if not url_string or not url_string.strip():
         return parsed_urls
 
-    # Split the string into individual lines
     lines = url_string.strip().splitlines()
     for line in lines:
         line = line.strip()
-        # Ignore empty lines or lines that are only comments
         if not line or line.startswith('#'):
             continue
         
-        # Split the line into URL and comment at the '#'
         parts = line.split('#', 1)
         url = parts[0].strip()
         note = parts[1].strip() if len(parts) > 1 else None
@@ -69,25 +65,23 @@ def init_driver():
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--log-level=3")  # Suppress console logs
-    options.add_experimental_option('excludeSwitches', ['enable-logging'])  # Disable DevTools logs
+    options.add_argument("--log-level=3")
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])
     
     service = ChromeService(executable_path=ChromeDriverManager().install())
-    service.log_path = os.devnull  # Suppress service logs
+    service.log_path = os.devnull
     
     return webdriver.Chrome(options=options, service=service)
 
 def check_keywords_in_text(text, return_details=False):
-    """
-    Check if text contains any JOB_KEYWORDS and none of the EXCLUDED_KEYWORDS.
-    """
+    """Check if text contains any JOB_KEYWORDS and none of the EXCLUDED_KEYWORDS."""
     if not text:
         return (False, [], {}) if return_details else False
 
     text_lower = text.lower()
     matched_keywords = []
     
-    # Step 1: Check for required keywords
+    # Check for required keywords
     has_required_keyword = False
     for keyword in JOB_KEYWORDS:
         if keyword.lower() in text_lower:
@@ -97,28 +91,29 @@ def check_keywords_in_text(text, return_details=False):
     if not has_required_keyword:
         return (False, [], {}) if return_details else False
 
-    # Step 2: Check for excluded keywords
+    # Check for excluded keywords
     for keyword in EXCLUDED_KEYWORDS:
         if keyword.lower() in text_lower:
-            # If an excluded word is found, reject the job
             return (False, [], {}) if return_details else False
             
-    # If we passed both checks, the job is a good match
     if return_details:
         return True, matched_keywords, {}
         
     return True
 
-def get_job_description(driver, job_url, job_title, company_name, show_details=False):
-    """Get job description from job details page"""
+def get_job_description_optimized(driver, show_details=False):
+    """
+    Get job description from the currently displayed job details panel.
+    This avoids navigating away from the search results page.
+    """
     try:
-        if show_details:
-            print(f"    - Checking description for: {job_title} at {company_name}")
+        # Wait for job details to load
+        WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".jobs-search__job-details"))
+        )
+        time.sleep(1)  # Small delay for content to fully render
         
-        driver.get(job_url)
-        time.sleep(4)
-        
-        # Try to click "Show more" button
+        # Try to click "Show more" button to expand description
         try:
             show_more_selectors = [
                 "button.show-more-less-html__button--more",
@@ -128,30 +123,17 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
             
             for selector in show_more_selectors:
                 try:
-                    show_more_btn = WebDriverWait(driver, 3).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
-                    
-                    try:
-                        overlay = driver.find_element(By.CSS_SELECTOR, ".show-more-less-html__fade-overlay")
-                        driver.execute_script("arguments[0].remove();", overlay)
-                        if show_details:
-                            print("      - Removed description overlay.")
+                    show_more_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                    if show_more_btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", show_more_btn)
                         time.sleep(0.5)
-                    except:
-                        pass
-                    
-                    driver.execute_script("arguments[0].click();", show_more_btn)
-                    time.sleep(1)
-                    if show_details:
-                        print("      - Clicked 'Show more' button.")
-                    break
+                        if show_details:
+                            print("      - Clicked 'Show more' button.")
+                        break
                 except:
                     continue
-        except Exception as e:
-            if show_details:
-                 print(f"      - Note: Could not click 'Show more' button ({e}).")
-            pass
+        except:
+            pass  # Show more button not found or not needed
         
         # Get job description
         description_text = ""
@@ -174,23 +156,6 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
             except:
                 continue
         
-        if not description_text:
-            if show_details:
-                print("      - ✗ Description not found.")
-            return ""
-        
-        # Check keywords
-        found, matched_keywords, _ = check_keywords_in_text(
-            f"{job_title} {description_text}", 
-            return_details=True
-        )
-        
-        if show_details:
-            if found:
-                print(f"      - ✓ Keywords matched: {', '.join(matched_keywords[:5])}")
-            else:
-                print("      - ✗ No relevant keywords matched in description.")
-
         return description_text
         
     except Exception as e:
@@ -200,8 +165,9 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
 
 def parse_job_listings(driver, check_keywords=False, show_details=False):
     """
-    Parse job listings, handling potential stale elements by re-finding them
-    after page navigations.
+    Parse job listings with optimized keyword checking.
+    For filtered searches, we click each job card and read the description
+    from the side panel without navigating away.
     """
     roles = []
     skipped_no_keywords = 0
@@ -216,24 +182,24 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
     if show_details:
         print(f"  - Found {num_positions} potential job cards in the HTML.")
 
-    # Iterate by index to handle stale elements
+    # Iterate by index
     for i in range(num_positions):
         if show_details:
             print(f"\n  --- Processing Card {i+1}/{num_positions} ---")
         
         try:
-            # Re-find elements on each iteration to get a fresh reference
+            # Re-find elements on each iteration
             positions = driver.find_elements(By.CSS_SELECTOR, master_selector)
             if i >= len(positions):
                 if show_details:
-                    print(f"    - ✗ Card index {i+1} is out of bounds after navigation. Ending page parse.")
+                    print(f"    - ✗ Card index {i+1} is out of bounds. Ending page parse.")
                 break
             
             position = positions[i]
 
-            # Scroll each job card into view before parsing
+            # Scroll card into view
             driver.execute_script("arguments[0].scrollIntoView({ behavior: 'smooth', block: 'center' });", position)
-            time.sleep(0.5)
+            time.sleep(0.3)
 
             # Check if promoted
             promoted = False
@@ -257,8 +223,10 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
                 try:
                     company = position.find_element(By.CSS_SELECTOR, ".job-card-container__primary-description").text.strip()
                 except:
-                    if show_details: print("    - ✗ Company name not found.")
-            if show_details: print(f"    - Company: {company}")
+                    if show_details: 
+                        print("    - ✗ Company name not found.")
+            if show_details: 
+                print(f"    - Company: {company}")
 
             # Get job link
             link = ""
@@ -266,48 +234,62 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
                 link_element = position.find_element(By.CSS_SELECTOR, "a[href*='/jobs/view/']")
                 link = link_element.get_attribute('href').split('?')[0]
             except Exception as e:
-                if show_details: print(f"    - ✗ Job link not found. Error: {e}")
-                continue # Skip this card if link is not found
-            if show_details: print(f"    - Link: {link}")
+                if show_details: 
+                    print(f"    - ✗ Job link not found. Error: {e}")
+                continue
+            if show_details: 
+                print(f"    - Link: {link}")
                 
             # Get job title
             title = "N/A"
             try:
                 title = position.find_element(By.CSS_SELECTOR, "a.job-card-container__link strong").text.strip()
             except:
-                if show_details: print("    - ✗ Job title not found.")
-            if show_details: print(f"    - Title: {title}")
+                if show_details: 
+                    print("    - ✗ Job title not found.")
+            if show_details: 
+                print(f"    - Title: {title}")
 
             # Get posted time
             posted_time = "N/A"
             try:
                 posted_time = position.find_element(By.CSS_SELECTOR, "time").text.strip()
             except:
-                pass # Not critical if not found
-            if show_details: print(f"    - Posted: {posted_time}")
+                pass
+            if show_details: 
+                print(f"    - Posted: {posted_time}")
 
-
-            # Check keywords if needed
+            # Check keywords if needed - OPTIMIZED APPROACH
             if check_keywords:
-                original_url = driver.current_url
-                description = get_job_description(driver, link, title, company, show_details)
-                
-                # Navigate back to the search results page
-                driver.get(original_url)
-                
-                # Wait for the job list to be present again to avoid stale elements
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, master_selector))
-                )
-                time.sleep(1.5) # Extra buffer for dynamic content to settle
-
-                title_and_description = f"{title} {description}"
-                found = check_keywords_in_text(title_and_description)
-                
-                if not found:
-                    skipped_no_keywords += 1
+                # Click the job card to load details in the side panel
+                try:
+                    link_element = position.find_element(By.CSS_SELECTOR, "a.job-card-container__link")
+                    driver.execute_script("arguments[0].click();", link_element)
+                    time.sleep(1.5)  # Wait for side panel to load
+                    
+                    # Get description from side panel (no navigation needed!)
+                    description = get_job_description_optimized(driver, show_details)
+                    
+                    title_and_description = f"{title} {description}"
+                    found, matched_keywords, _ = check_keywords_in_text(title_and_description, return_details=True)
+                    
                     if show_details:
-                        print("    - Result: SKIPPED (keyword filter)")
+                        if found:
+                            print(f"      - ✓ Keywords matched: {', '.join(matched_keywords[:5])}")
+                        else:
+                            print("      - ✗ No relevant keywords matched.")
+                    
+                    if not found:
+                        skipped_no_keywords += 1
+                        if show_details:
+                            print("    - Result: SKIPPED (keyword filter)")
+                        continue
+                        
+                except Exception as e:
+                    if show_details:
+                        print(f"      - ✗ Error checking keywords: {e}")
+                    # If we can't check keywords, skip this job to be safe
+                    skipped_no_keywords += 1
                     continue
 
             # Get company picture
@@ -316,7 +298,7 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
                 img_element = position.find_element(By.CSS_SELECTOR, "img")
                 picture = img_element.get_attribute('src')
             except:
-                pass # Not critical if not found
+                pass
 
             roles.append((company, title, link, picture, posted_time))
             if show_details:
@@ -357,7 +339,7 @@ def scrape_url(url, check_keywords=False, show_details=False):
 
         page_number = 1
         jobs_per_page = 25
-        max_pages = 10 # Safety limit
+        max_pages = 10
         
         while page_number <= max_pages:
             if show_details:
@@ -365,7 +347,7 @@ def scrape_url(url, check_keywords=False, show_details=False):
             else:
                 print(f"  Page {page_number}...", end=" ")
 
-            
+            # Navigate to the page
             if page_number > 1:
                 parsed_url = urlparse(url)
                 query_params = parse_qs(parsed_url.query)
@@ -382,6 +364,7 @@ def scrape_url(url, check_keywords=False, show_details=False):
                 driver.get(page_url)
                 time.sleep(5)
             
+            # Scroll to load all jobs
             if show_details:
                 print("  - Scrolling to load all jobs on the page...")
             else:
@@ -417,19 +400,39 @@ def scrape_url(url, check_keywords=False, show_details=False):
                 else:
                     print("Scroll failed.", end=" ")
 
+            # Get the actual number of job cards on this page
+            positions = driver.find_elements(By.CSS_SELECTOR, "li.occludable-update")
+            actual_jobs_on_page = len(positions)
+            
+            if show_details:
+                print(f"  - Found {actual_jobs_on_page} job cards on this page")
+            
+            # Parse the jobs
             roles_on_page = parse_job_listings(driver, check_keywords, show_details)
             all_roles.extend(roles_on_page)
             
             if not show_details:
-                # Count promoted from the original list as parsing re-finds elements
-                positions = driver.find_elements(By.CSS_SELECTOR, "li.occludable-update")
                 promoted_count = sum(1 for pos in positions if 'promoted' in pos.text.lower())
                 print(f"  Found {len(roles_on_page)} jobs ({promoted_count} promoted)")
 
-            if len(roles_on_page) < jobs_per_page:
+            # FIXED: Check if there are fewer job cards than expected (reached end)
+            # Don't rely on roles_on_page length when filtering is enabled
+            if actual_jobs_on_page < jobs_per_page:
                 if show_details:
-                    print("\n  - Reached the last page of results.")
+                    print(f"\n  - Reached the last page (only {actual_jobs_on_page} jobs found, expected {jobs_per_page}).")
                 break
+            
+            # Check if next page button exists and is enabled
+            try:
+                next_button = driver.find_element(By.CSS_SELECTOR, "button.jobs-search-pagination__button--next")
+                if "disabled" in next_button.get_attribute("class") or not next_button.is_enabled():
+                    if show_details:
+                        print("\n  - Next button is disabled. Reached the last page.")
+                    break
+            except:
+                if show_details:
+                    print("\n  - Next button not found. Might be the last page.")
+                # Continue anyway, the page navigation will fail naturally if there's no next page
             
             page_number += 1
         
@@ -478,4 +481,3 @@ def get_recent_roles(show_details=False):
 if __name__ == '__main__':
     show_details_arg = os.getenv('SHOW_DETAILED_LOGS', 'False').lower() == 'true'
     get_recent_roles(show_details=show_details_arg)
-
