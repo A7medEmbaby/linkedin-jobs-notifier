@@ -21,25 +21,17 @@ LINKEDIN_URLS_UNFILTERED = os.getenv('LINKEDIN_URLS_UNFILTERED', '')
 LINKEDIN_URLS_FILTERED = os.getenv('LINKEDIN_URLS_FILTERED', '')
 SELENIUM_USER_DATA_DIR = os.getenv('SELENIUM_USER_DATA_DIR')
 
-# Keywords for desired job roles
-JOB_KEYWORDS = [
-    ".net", "dotnet", "dot net", ". net",
-    ".net core", "dotnet core", "dot net core",
-    ".net framework", "dotnet framework",
-    ".net 6", ".net 7", ".net 8", ".net 9",
-    "dotnet6", "dotnet7", "dotnet8",
-    "asp.net", "asp dotnet", "aspdotnet", "asp net",
-    "asp.net core", "asp.net core", "aspnetcore",
-    "asp.net mvc", "asp.net web api",
-    "c#", "c sharp", "csharp", "c #",
-    "entity framework", "ef core",
-    "blazor", "razor", "wcf", "wpf", "xamarin", "maui",
-    "visual studio", "nuget"
-]
+def load_keywords_from_env(env_var_name):
+    """Loads keywords from a multi-line .env variable."""
+    keywords_str = os.getenv(env_var_name, '')
+    if not keywords_str:
+        return []
+    # Split by newline, strip whitespace, and filter out empty lines
+    return [line.strip() for line in keywords_str.strip().splitlines() if line.strip()]
 
-# Keywords to exclude irrelevant jobs
-EXCLUDED_KEYWORDS = [
-]
+JOB_KEYWORDS = load_keywords_from_env('JOB_KEYWORDS')
+EXCLUDED_KEYWORDS = load_keywords_from_env('EXCLUDED_KEYWORDS')
+
 
 def parse_multiline_urls(url_string):
     """Parses a multi-line string of URLs, ignoring comments and empty lines."""
@@ -113,7 +105,6 @@ def check_keywords_in_text(text, return_details=False):
             
     # If we passed both checks, the job is a good match
     if return_details:
-        # For simplicity, we won't return search locations in this new logic
         return True, matched_keywords, {}
         
     return True
@@ -138,8 +129,18 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
             for selector in show_more_selectors:
                 try:
                     show_more_btn = WebDriverWait(driver, 3).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                     )
+                    
+                    try:
+                        overlay = driver.find_element(By.CSS_SELECTOR, ".show-more-less-html__fade-overlay")
+                        driver.execute_script("arguments[0].remove();", overlay)
+                        if show_details:
+                            print("      - Removed description overlay.")
+                        time.sleep(0.5)
+                    except:
+                        pass
+                    
                     driver.execute_script("arguments[0].click();", show_more_btn)
                     time.sleep(1)
                     if show_details:
@@ -197,22 +198,44 @@ def get_job_description(driver, job_url, job_title, company_name, show_details=F
             print(f"      - ✗ Error getting description: {e}")
         return ""
 
-def parse_job_listings(driver, positions, check_keywords=False, show_details=False):
-    """Parse job listings and return roles"""
+def parse_job_listings(driver, check_keywords=False, show_details=False):
+    """
+    Parse job listings, handling potential stale elements by re-finding them
+    after page navigations.
+    """
     roles = []
     skipped_no_keywords = 0
     promoted_included = 0
     
-    for i, position in enumerate(positions):
+    master_selector = "li.occludable-update"
+    
+    # Get initial count of job cards
+    positions = driver.find_elements(By.CSS_SELECTOR, master_selector)
+    num_positions = len(positions)
+
+    if show_details:
+        print(f"  - Found {num_positions} potential job cards in the HTML.")
+
+    # Iterate by index to handle stale elements
+    for i in range(num_positions):
         if show_details:
-            print(f"\n  --- Processing Card {i+1}/{len(positions)} ---")
+            print(f"\n  --- Processing Card {i+1}/{num_positions} ---")
         
         try:
-            # Scroll each job card into view before parsing to trigger lazy loading of its content
+            # Re-find elements on each iteration to get a fresh reference
+            positions = driver.find_elements(By.CSS_SELECTOR, master_selector)
+            if i >= len(positions):
+                if show_details:
+                    print(f"    - ✗ Card index {i+1} is out of bounds after navigation. Ending page parse.")
+                break
+            
+            position = positions[i]
+
+            # Scroll each job card into view before parsing
             driver.execute_script("arguments[0].scrollIntoView({ behavior: 'smooth', block: 'center' });", position)
             time.sleep(0.5)
 
-            # Check if promoted (but don't skip - just track for statistics)
+            # Check if promoted
             promoted = False
             try:
                 footer_items = position.find_elements(By.CSS_SELECTOR, ".job-card-container__footer-item")
@@ -227,89 +250,57 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
                 pass
 
             # Get company name
-            company = None
-            company_selectors = [
-                ".artdeco-entity-lockup__subtitle",
-                ".job-card-container__primary-description"
-            ]
-            
-            for comp_sel in company_selectors:
+            company = "N/A"
+            try:
+                company = position.find_element(By.CSS_SELECTOR, ".artdeco-entity-lockup__subtitle").text.strip()
+            except:
                 try:
-                    company = position.find_element(By.CSS_SELECTOR, comp_sel).text.strip()
-                    if company:
-                        break
+                    company = position.find_element(By.CSS_SELECTOR, ".job-card-container__primary-description").text.strip()
                 except:
-                    continue
-            
-            if not company:
-                if show_details:
-                    print("    - ✗ Company name not found. Skipping card.")
-                continue
-            if show_details:
-                print(f"    - Company: {company}")
+                    if show_details: print("    - ✗ Company name not found.")
+            if show_details: print(f"    - Company: {company}")
 
             # Get job link
-            link = None
-            link_selectors = [
-                "a.job-card-container__link",
-                "a[href*='/jobs/view/']"
-            ]
-            
-            for link_sel in link_selectors:
-                try:
-                    link_element = position.find_element(By.CSS_SELECTOR, link_sel)
-                    link = link_element.get_attribute('href').split('?')[0]
-                    if link:
-                        break
-                except:
-                    continue
-            
-            if not link:
-                if show_details:
-                    print("    - ✗ Job link not found. Skipping card.")
-                continue
-            if show_details:
-                print(f"    - Link: {link}")
-
+            link = ""
+            try:
+                link_element = position.find_element(By.CSS_SELECTOR, "a[href*='/jobs/view/']")
+                link = link_element.get_attribute('href').split('?')[0]
+            except Exception as e:
+                if show_details: print(f"    - ✗ Job link not found. Error: {e}")
+                continue # Skip this card if link is not found
+            if show_details: print(f"    - Link: {link}")
+                
             # Get job title
-            title = None
-            title_selectors = [
-                "a.job-card-container__link strong",
-                ".job-card-container__link",
-                ".artdeco-entity-lockup__title a"
-            ]
-            
-            for title_sel in title_selectors:
-                try:
-                    title_element = position.find_element(By.CSS_SELECTOR, title_sel)
-                    title = title_element.text.strip()
-                    if title:
-                        break
-                except:
-                    continue
-            
-            if not title:
-                if show_details:
-                    print("    - ✗ Job title not found. Skipping card.")
-                continue
-            if show_details:
-                print(f"    - Title: {title}")
+            title = "N/A"
+            try:
+                title = position.find_element(By.CSS_SELECTOR, "a.job-card-container__link strong").text.strip()
+            except:
+                if show_details: print("    - ✗ Job title not found.")
+            if show_details: print(f"    - Title: {title}")
 
             # Get posted time
             posted_time = "N/A"
             try:
-                time_element = position.find_element(By.CSS_SELECTOR, "time")
-                posted_time = time_element.text.strip()
+                posted_time = position.find_element(By.CSS_SELECTOR, "time").text.strip()
             except:
-                pass
-            if show_details:
-                print(f"    - Posted: {posted_time}")
+                pass # Not critical if not found
+            if show_details: print(f"    - Posted: {posted_time}")
 
 
             # Check keywords if needed
             if check_keywords:
+                original_url = driver.current_url
                 description = get_job_description(driver, link, title, company, show_details)
                 
+                # Navigate back to the search results page
+                driver.get(original_url)
+                
+                # Wait for the job list to be present again to avoid stale elements
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, master_selector))
+                )
+                time.sleep(1.5) # Extra buffer for dynamic content to settle
+
                 title_and_description = f"{title} {description}"
                 found = check_keywords_in_text(title_and_description)
                 
@@ -320,12 +311,12 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
                     continue
 
             # Get company picture
-            picture = None
+            picture = "https://via.placeholder.com/100"
             try:
                 img_element = position.find_element(By.CSS_SELECTOR, "img")
                 picture = img_element.get_attribute('src')
             except:
-                picture = "https://via.placeholder.com/100"
+                pass # Not critical if not found
 
             roles.append((company, title, link, picture, posted_time))
             if show_details:
@@ -333,18 +324,17 @@ def parse_job_listings(driver, positions, check_keywords=False, show_details=Fal
             
         except Exception as e:
             if show_details:
-                print(f"    - ✗ UNEXPECTED ERROR parsing this card: {e}")
-                print("      - HTML of failing card:")
-                print(position.get_attribute('outerHTML'))
+                print(f"    - ✗ UNEXPECTED ERROR parsing card {i+1}: {e}")
             continue
     
-    print("\n  --- Parsing Summary ---")
-    summary = f"  Found {len(roles)} jobs from {len(positions)} cards"
-    if promoted_included > 0:
-        summary += f" ({promoted_included} promoted)"
-    if skipped_no_keywords > 0:
-        summary += f", skipped {skipped_no_keywords} on keyword filter"
-    print(summary)
+    if show_details:
+        print("\n  --- Parsing Summary ---")
+        summary = f"  Found {len(roles)} jobs from {num_positions} cards"
+        if promoted_included > 0:
+            summary += f" ({promoted_included} promoted)"
+        if skipped_no_keywords > 0:
+            summary += f", skipped {skipped_no_keywords} on keyword filter"
+        print(summary)
     
     return roles
 
@@ -370,7 +360,11 @@ def scrape_url(url, check_keywords=False, show_details=False):
         max_pages = 10 # Safety limit
         
         while page_number <= max_pages:
-            print(f"\n  --- Page {page_number} ---")
+            if show_details:
+                print(f"\n  --- Page {page_number} ---")
+            else:
+                print(f"  Page {page_number}...", end=" ")
+
             
             if page_number > 1:
                 parsed_url = urlparse(url)
@@ -388,10 +382,14 @@ def scrape_url(url, check_keywords=False, show_details=False):
                 driver.get(page_url)
                 time.sleep(5)
             
-            print("  - Scrolling to load all jobs on the page...")
+            if show_details:
+                print("  - Scrolling to load all jobs on the page...")
+            else:
+                print("Scrolling...", end=" ")
+
             try:
                 scroll_container = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, ".scaffold-layout__list-container"))
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".scaffold-layout__list"))
                 )
                 
                 last_height = driver.execute_script("return arguments[0].scrollHeight", scroll_container)
@@ -408,25 +406,29 @@ def scrape_url(url, check_keywords=False, show_details=False):
                     last_height = new_height
                     scroll_attempts += 1
                 
-                print("  - Scrolling complete.")
+                if show_details:
+                    print("  - Scrolling complete.")
+                else:
+                    print("Done.", end="")
 
             except Exception as e:
-                print(f"    ✗ Could not find scroll container or scroll failed: {e}")
+                if show_details:
+                    print(f"    ✗ Could not find scroll container or scroll failed: {e}")
+                else:
+                    print("Scroll failed.", end=" ")
 
-            master_selector = "li.occludable-update"
-            positions = driver.find_elements(By.CSS_SELECTOR, master_selector)
+            roles_on_page = parse_job_listings(driver, check_keywords, show_details)
+            all_roles.extend(roles_on_page)
             
-            print(f"  - Found {len(positions)} potential job cards in the HTML.")
-            
-            if not positions:
-                print("  - No more jobs found on this page.")
-                break
+            if not show_details:
+                # Count promoted from the original list as parsing re-finds elements
+                positions = driver.find_elements(By.CSS_SELECTOR, "li.occludable-update")
+                promoted_count = sum(1 for pos in positions if 'promoted' in pos.text.lower())
+                print(f"  Found {len(roles_on_page)} jobs ({promoted_count} promoted)")
 
-            roles = parse_job_listings(driver, positions, check_keywords, True) # Force show_details for logging
-            all_roles.extend(roles)
-            
-            if len(positions) < jobs_per_page:
-                print("\n  - Reached the last page of results.")
+            if len(roles_on_page) < jobs_per_page:
+                if show_details:
+                    print("\n  - Reached the last page of results.")
                 break
             
             page_number += 1
@@ -440,11 +442,12 @@ def scrape_url(url, check_keywords=False, show_details=False):
     
     return all_roles
 
-def get_recent_roles(show_details=True): # Changed default to True for logging
+def get_recent_roles(show_details=False):
     """Get roles from all configured URLs"""
     all_roles = []
+    log_mode = "(Detailed Log Mode)" if show_details else ""
     print("\n" + "="*60)
-    print("LinkedIn Job Search (Detailed Log Mode)")
+    print(f"LinkedIn Job Search {log_mode}")
     print("="*60)
 
     # Scrape unfiltered URLs
@@ -473,5 +476,6 @@ def get_recent_roles(show_details=True): # Changed default to True for logging
     return all_roles
 
 if __name__ == '__main__':
-    get_recent_roles(show_details=True)
+    show_details_arg = os.getenv('SHOW_DETAILED_LOGS', 'False').lower() == 'true'
+    get_recent_roles(show_details=show_details_arg)
 
