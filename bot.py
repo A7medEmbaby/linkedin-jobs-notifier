@@ -135,15 +135,17 @@ async def safe_send(channel, content=None, embed=None, max_retries=3):
                 return None
                 
 def prune_old_jobs():
-    """Checks the config file and removes job links older than POSTED_JOBS_EXPIRATION_PERIOD_HOURS."""
+    """Checks the config file and removes job links and stop markers older than POSTED_JOBS_EXPIRATION_PERIOD_HOURS."""
     config = get_config()
     posted_jobs = config.get("posted", {})
+    last_job_per_source = config.get("last_job_per_source", {})
 
     # --- Backward Compatibility: Convert old list format to new dict format ---
     if isinstance(posted_jobs, list):
         print("  - Updating config format for posted jobs...")
         new_posted = {link: datetime.datetime.now().isoformat() for link in posted_jobs}
         config["posted"] = new_posted
+        config["last_job_per_source"] = {}  # Initialize empty
         save_config(config)
         # No pruning on first conversion, just update the format
         return
@@ -152,23 +154,38 @@ def prune_old_jobs():
     now = datetime.datetime.now()
     expiration_time = datetime.timedelta(hours=POSTED_JOBS_EXPIRATION_PERIOD_HOURS)
     
-    # Create a new dictionary with only the non-expired jobs
+    # Prune posted jobs
     updated_posted_jobs = {}
-    expired_count = 0
+    expired_posted_count = 0
     for link, timestamp_str in posted_jobs.items():
         try:
             post_time = datetime.datetime.fromisoformat(timestamp_str)
             if now - post_time < expiration_time:
                 updated_posted_jobs[link] = timestamp_str
             else:
-                expired_count += 1
+                expired_posted_count += 1
         except (ValueError, TypeError):
             # If timestamp is invalid, just drop it
-            expired_count += 1
+            expired_posted_count += 1
 
-    if expired_count > 0:
-        print(f"  - Pruned {expired_count} old job link(s) from history (older than {POSTED_JOBS_EXPIRATION_PERIOD_HOURS} hours).")
+    # Prune last_job_per_source entries
+    updated_last_job_per_source = {}
+    expired_marker_count = 0
+    for source_url, marker_data in last_job_per_source.items():
+        try:
+            marker_time = datetime.datetime.fromisoformat(marker_data["timestamp"])
+            if now - marker_time < expiration_time:
+                updated_last_job_per_source[source_url] = marker_data
+            else:
+                expired_marker_count += 1
+        except (ValueError, TypeError, KeyError):
+            # If invalid, drop it
+            expired_marker_count += 1
+
+    if expired_posted_count > 0 or expired_marker_count > 0:
+        print(f"  - Pruned {expired_posted_count} old job link(s) and {expired_marker_count} stop marker(s) from history (older than {POSTED_JOBS_EXPIRATION_PERIOD_HOURS} hours).")
         config["posted"] = updated_posted_jobs
+        config["last_job_per_source"] = updated_last_job_per_source
         save_config(config)
 
 
@@ -198,12 +215,15 @@ async def get_new_roles_postings_task():
         print(f"{'='*60}")
         await safe_send(DEBUG_CHANNEL, f"🔍 **Starting job search cycle** at {scrape_start_time.strftime('%H:%M:%S')}")
         
-        # Scrape LinkedIn
+        # Scrape LinkedIn with stop markers
         print("Scraping LinkedIn...")
         await safe_send(DEBUG_CHANNEL, "⏳ Scraping LinkedIn...")
-        linkedin_roles = scraper.get_recent_roles(show_details=SHOW_DETAILED_LOGS)
+        linkedin_roles, linkedin_stop_markers = scraper.get_recent_roles(show_details=SHOW_DETAILED_LOGS)
 
-        # Scrape Wuzzuf if configured
+        # Update stop markers for LinkedIn URLs (done AFTER posting to avoid race conditions)
+        # We'll update these at the end after saving all posted jobs
+
+        # Scrape Wuzzuf if configured (no stop markers)
         wuzzuf_roles = []
         if WUZZUF_URLS_UNFILTERED or WUZZUF_URLS_FILTERED:
             print("Scraping Wuzzuf...")
@@ -265,11 +285,32 @@ async def get_new_roles_postings_task():
         print(f"\n{'='*60}")
         if unique_roles_to_post:
             await send_companies_list(companies_for_this_run)
+            
+            # Update stop markers for LinkedIn URLs BEFORE saving config
+            config["last_job_per_source"] = config.get("last_job_per_source", {})
+            for source_url, first_job_link in linkedin_stop_markers.items():
+                if first_job_link:
+                    config["last_job_per_source"][source_url] = {
+                        "job_link": first_job_link,
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+            
             save_config(config)
             print(f"✓ Posted {len(unique_roles_to_post)} new jobs from {len(companies_for_this_run)} companies")
             print(f"⏱️  Scraping took {int(scrape_duration // 60)} minutes {int(scrape_duration % 60)} seconds")
             await safe_send(DEBUG_CHANNEL, f"✅ **Posted {len(unique_roles_to_post)} new jobs** from {len(companies_for_this_run)} companies\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
         else:
+            # Even if no jobs to post, update stop markers if we scraped
+            if linkedin_stop_markers:
+                config["last_job_per_source"] = config.get("last_job_per_source", {})
+                for source_url, first_job_link in linkedin_stop_markers.items():
+                    if first_job_link:
+                        config["last_job_per_source"][source_url] = {
+                            "job_link": first_job_link,
+                            "timestamp": datetime.datetime.now().isoformat()
+                        }
+                save_config(config)
+            
             print(f"✓ No new jobs found to post.")
             print(f"⏱️  Scraping took {int(scrape_duration // 60)} minutes {int(scrape_duration % 60)} seconds")
             await safe_send(DEBUG_CHANNEL, f"ℹ️ No new jobs found to post\n⏱️ Scraping took {int(scrape_duration // 60)}m {int(scrape_duration % 60)}s")
@@ -298,9 +339,32 @@ async def get_new_roles_postings_task():
             await asyncio.sleep(60 * 20)
 
 def get_config():
-    with open(os.path.join(sys.path[0], 'config.json')) as f:
-        config = json.load(f)
-        return config
+    config_path = os.path.join(sys.path[0], 'config.json')
+    
+    # Check if config file exists and is valid
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+            # Ensure last_job_per_source exists
+            if "last_job_per_source" not in config:
+                config["last_job_per_source"] = {}
+            # Ensure other required fields exist
+            if "posted" not in config:
+                config["posted"] = {}
+            if "blacklist" not in config:
+                config["blacklist"] = []
+            return config
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        # File doesn't exist or is empty/invalid - create default config
+        print(f"⚠️  Config file missing or invalid: {e}")
+        print("  - Creating new config.json with default values...")
+        default_config = {
+            "blacklist": [],
+            "posted": {},
+            "last_job_per_source": {}
+        }
+        save_config(default_config)
+        return default_config
 
 def save_config(config):
     with open(os.path.join(sys.path[0], 'config.json'), 'w') as f:

@@ -3,3 +3,4 @@ __pycache__/
 .env
 config.json
 start_bot.bat
+selenium_data/

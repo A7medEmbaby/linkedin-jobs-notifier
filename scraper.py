@@ -8,7 +8,7 @@ from selenium.webdriver.common.actions.wheel_input import ScrollOrigin
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
-import os, time, json, re
+import os, sys, time, json, re, datetime
 import logging
 
 # Suppress Selenium and WebDriver Manager logs
@@ -76,111 +76,81 @@ def init_driver():
 def check_keywords_in_text(text, return_details=False):
     """Check if text contains any JOB_KEYWORDS and none of the EXCLUDED_KEYWORDS."""
     if not text:
-        return (False, [], {}) if return_details else False
-
-    text_lower = text.lower()
-    matched_keywords = []
+        return (False, [], []) if return_details else False
     
-    # Check for required keywords
-    has_required_keyword = False
-    for keyword in JOB_KEYWORDS:
-        if keyword.lower() in text_lower:
-            has_required_keyword = True
-            matched_keywords.append(keyword)
-
-    if not has_required_keyword:
-        return (False, [], {}) if return_details else False
-
-    # Check for excluded keywords
+    text_lower = text.lower()
+    
+    # Check for excluded keywords first
+    excluded_found = []
     for keyword in EXCLUDED_KEYWORDS:
         if keyword.lower() in text_lower:
-            return (False, [], {}) if return_details else False
-            
+            excluded_found.append(keyword)
+    
+    if excluded_found:
+        return (False, [], excluded_found) if return_details else False
+    
+    # Check for required keywords
+    keywords_found = []
+    for keyword in JOB_KEYWORDS:
+        if keyword.lower() in text_lower:
+            keywords_found.append(keyword)
+    
+    has_keywords = len(keywords_found) > 0
+    
     if return_details:
-        return True, matched_keywords, {}
-        
-    return True
+        return (has_keywords, keywords_found, [])
+    return has_keywords
 
-def get_job_description_optimized(driver, show_details=False):
-    """
-    Get job description from the currently displayed job details panel.
-    This avoids navigating away from the search results page.
-    """
+def get_config():
+    """Load config from config.json"""
+    config_path = os.path.join(sys.path[0], 'config.json')
+    
     try:
-        # Wait for job details to load
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".jobs-search__job-details"))
-        )
-        time.sleep(1)  # Small delay for content to fully render
-        
-        # Try to click "Show more" button to expand description
-        try:
-            show_more_selectors = [
-                "button.show-more-less-html__button--more",
-                "button.show-more-less-html__button",
-                ".jobs-description__footer-button"
-            ]
-            
-            for selector in show_more_selectors:
-                try:
-                    show_more_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                    if show_more_btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", show_more_btn)
-                        time.sleep(0.5)
-                        if show_details:
-                            print("      - Clicked 'Show more' button.")
-                        break
-                except:
-                    continue
-        except:
-            pass  # Show more button not found or not needed
-        
-        # Get job description
-        description_text = ""
-        description_selectors = [
-            ".jobs-description__content",
-            ".jobs-description-content__text",
-            ".jobs-box__html-content",
-            ".description__text",
-            ".jobs-description",
-            "div.jobs-box__html-content",
-            "article.jobs-description__container"
-        ]
-        
-        for selector in description_selectors:
-            try:
-                description_element = driver.find_element(By.CSS_SELECTOR, selector)
-                description_text = description_element.text
-                if description_text and len(description_text) > 50:
-                    break
-            except:
-                continue
-        
-        return description_text
-        
-    except Exception as e:
-        if show_details:
-            print(f"      - ✗ Error getting description: {e}")
-        return ""
+        with open(config_path) as f:
+            config = json.load(f)
+            if "last_job_per_source" not in config:
+                config["last_job_per_source"] = {}
+            if "posted" not in config:
+                config["posted"] = {}
+            return config
+    except (FileNotFoundError, json.JSONDecodeError):
+        # Return default config if file doesn't exist or is invalid
+        return {
+            "posted": {},
+            "last_job_per_source": {}
+        }
 
-def parse_job_listings(driver, check_keywords=False, show_details=False):
-    """
-    Parse job listings with optimized keyword checking.
-    For filtered searches, we click each job card and read the description
-    from the side panel without navigating away.
-    """
-    roles = []
-    skipped_no_keywords = 0
-    promoted_included = 0
+def get_stop_marker(url):
+    """Get the stop marker (last job) for a LinkedIn URL if it exists."""
+    config = get_config()
+    last_job_per_source = config.get("last_job_per_source", {})
     
+    if url not in last_job_per_source:
+        return None
+    
+    marker_data = last_job_per_source[url]
+    marker_link = marker_data.get("job_link")
+    
+    # Return the marker link directly - no need to verify it's in posted
+    # The marker might be a job that didn't pass filters but is still valid as a stop point
+    return marker_link if marker_link else None
+
+def parse_job_listings(driver, check_keywords, show_details, stop_marker=None):
+    """Parse job listings from current page. Returns (roles, hit_stop_marker, first_job_link_on_page)"""
     master_selector = "li.occludable-update"
-    
-    # Get initial count of job cards
     positions = driver.find_elements(By.CSS_SELECTOR, master_selector)
     num_positions = len(positions)
-
+    
     if show_details:
-        print(f"  - Found {num_positions} potential job cards in the HTML.")
+        print(f"\n  --- Parsing {num_positions} Job Cards ---")
+        if stop_marker:
+            print(f"  - Stop marker active: {stop_marker}")
+    
+    roles = []
+    promoted_included = 0
+    skipped_no_keywords = 0
+    hit_stop_marker = False
+    first_job_link_on_page = None  # Track the very first job link we encounter
 
     # Iterate by index
     for i in range(num_positions):
@@ -239,6 +209,19 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
                 continue
             if show_details: 
                 print(f"    - Link: {link}")
+            
+            # CRITICAL: Track the very first job link on the page (for stop marker)
+            if first_job_link_on_page is None:
+                first_job_link_on_page = link
+            
+            # CHECK FOR STOP MARKER - This is the key optimization!
+            if stop_marker and link == stop_marker:
+                if show_details:
+                    print(f"    - ⚠️  STOP MARKER HIT! Stopping scrape at this job.")
+                else:
+                    print(f"\n  ⚠️  Stop marker hit! Ending scrape early.")
+                hit_stop_marker = True
+                break  # Stop immediately when we hit the marker
                 
             # Get job title
             title = "N/A"
@@ -253,31 +236,33 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
             # Get posted time
             posted_time = "N/A"
             try:
-                posted_time = position.find_element(By.CSS_SELECTOR, "time").text.strip()
+                posted_time = position.find_element(By.CSS_SELECTOR, "time").get_attribute("datetime")
             except:
-                pass
-            if show_details: 
-                print(f"    - Posted: {posted_time}")
+                if show_details: 
+                    print("    - ✗ Posted time not found.")
 
-            # Check keywords if needed - OPTIMIZED APPROACH
+            # Keyword check if enabled
             if check_keywords:
-                # Click the job card to load details in the side panel
+                if show_details:
+                    print("    - Checking keywords...")
                 try:
-                    link_element = position.find_element(By.CSS_SELECTOR, "a.job-card-container__link")
-                    driver.execute_script("arguments[0].click();", link_element)
-                    time.sleep(1.5)  # Wait for side panel to load
+                    # Get more detailed text for keyword matching
+                    full_text = f"{title} {company}"
+                    try:
+                        desc = position.find_element(By.CSS_SELECTOR, ".job-card-container__job-insight-text").text
+                        full_text += f" {desc}"
+                    except:
+                        pass
                     
-                    # Get description from side panel (no navigation needed!)
-                    description = get_job_description_optimized(driver, show_details)
-                    
-                    title_and_description = f"{title} {description}"
-                    found, matched_keywords, _ = check_keywords_in_text(title_and_description, return_details=True)
+                    found, keywords_found, excluded_found = check_keywords_in_text(full_text, return_details=True)
                     
                     if show_details:
-                        if found:
-                            print(f"      - ✓ Keywords matched: {', '.join(matched_keywords[:5])}")
-                        else:
-                            print("      - ✗ No relevant keywords matched.")
+                        if keywords_found:
+                            print(f"      - ✓ Keywords found: {', '.join(keywords_found)}")
+                        if excluded_found:
+                            print(f"      - ✗ Excluded keywords found: {', '.join(excluded_found)}")
+                        if not found and not excluded_found:
+                            print(f"      - No matching keywords")
                     
                     if not found:
                         skipped_no_keywords += 1
@@ -316,15 +301,26 @@ def parse_job_listings(driver, check_keywords=False, show_details=False):
             summary += f" ({promoted_included} promoted)"
         if skipped_no_keywords > 0:
             summary += f", skipped {skipped_no_keywords} on keyword filter"
+        if hit_stop_marker:
+            summary += " [STOPPED EARLY]"
         print(summary)
     
-    return roles
+    return roles, hit_stop_marker, first_job_link_on_page
 
 def scrape_url(url, check_keywords=False, show_details=False):
-    """Scrape a single LinkedIn URL with pagination and lazy loading."""
+    """Scrape a single LinkedIn URL with pagination and smart early stopping."""
     driver = init_driver()
     driver.set_page_load_timeout(300)
     all_roles = []
+    first_job_link = None  # Track the first job we scrape
+    
+    # Get stop marker for this URL
+    stop_marker = get_stop_marker(url)
+    if stop_marker:
+        if show_details:
+            print(f"  ℹ️  Stop marker found for this URL")
+        else:
+            print(f"  ℹ️  Using stop marker for early stopping")
     
     try:
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -335,11 +331,12 @@ def scrape_url(url, check_keywords=False, show_details=False):
         if "login" in driver.current_url.lower() or "authwall" in driver.current_url.lower():
             print("  ✗ Not logged in! Please run: python log_in_to_linkedin.py")
             driver.quit()
-            return []
+            return [], None
 
         page_number = 1
         jobs_per_page = 25
         max_pages = 10
+        stopped_early = False
         
         while page_number <= max_pages:
             if show_details:
@@ -392,7 +389,7 @@ def scrape_url(url, check_keywords=False, show_details=False):
                 if show_details:
                     print("  - Scrolling complete.")
                 else:
-                    print("Done.", end="")
+                    print("Done.", end=" ")
 
             except Exception as e:
                 if show_details:
@@ -407,16 +404,28 @@ def scrape_url(url, check_keywords=False, show_details=False):
             if show_details:
                 print(f"  - Found {actual_jobs_on_page} job cards on this page")
             
-            # Parse the jobs
-            roles_on_page = parse_job_listings(driver, check_keywords, show_details)
+            # Parse the jobs with stop marker check
+            roles_on_page, hit_stop_marker, first_link_on_page = parse_job_listings(driver, check_keywords, show_details, stop_marker)
             all_roles.extend(roles_on_page)
+            
+            # Track the first job link we see on page 1 (for updating stop marker later)
+            if page_number == 1 and first_link_on_page and not first_job_link:
+                first_job_link = first_link_on_page
+                if show_details:
+                    print(f"  - Tracking first job on page 1 as future stop marker: {first_job_link}")
             
             if not show_details:
                 promoted_count = sum(1 for pos in positions if 'promoted' in pos.text.lower())
                 print(f"  Found {len(roles_on_page)} jobs ({promoted_count} promoted)")
 
-            # FIXED: Check if there are fewer job cards than expected (reached end)
-            # Don't rely on roles_on_page length when filtering is enabled
+            # Check if we hit the stop marker
+            if hit_stop_marker:
+                stopped_early = True
+                if not show_details:
+                    print(f"  ✓ Early stop: Found all new jobs!")
+                break
+
+            # Check if there are fewer job cards than expected (reached end)
             if actual_jobs_on_page < jobs_per_page:
                 if show_details:
                     print(f"\n  - Reached the last page (only {actual_jobs_on_page} jobs found, expected {jobs_per_page}).")
@@ -432,22 +441,26 @@ def scrape_url(url, check_keywords=False, show_details=False):
             except:
                 if show_details:
                     print("\n  - Next button not found. Might be the last page.")
-                # Continue anyway, the page navigation will fail naturally if there's no next page
             
             page_number += 1
         
-        print(f"\n  ✓ Total from this URL: {len(all_roles)} jobs")
+        if stopped_early:
+            print(f"\n  ✓ Total from this URL: {len(all_roles)} jobs (stopped early at page {page_number})")
+        else:
+            print(f"\n  ✓ Total from this URL: {len(all_roles)} jobs")
         
     except Exception as e:
         print(f"  ✗ An error occurred during scraping: {e}")
     finally:
         driver.quit()
     
-    return all_roles
+    return all_roles, first_job_link
 
 def get_recent_roles(show_details=False):
-    """Get roles from all configured URLs"""
+    """Get roles from all configured URLs. Returns (all_roles, stop_markers_dict)"""
     all_roles = []
+    stop_markers = {}  # Map URL -> first job link scraped
+    
     log_mode = "(Detailed Log Mode)" if show_details else ""
     print("\n" + "="*60)
     print(f"LinkedIn Job Search {log_mode}")
@@ -458,8 +471,10 @@ def get_recent_roles(show_details=False):
     if unfiltered_urls:
         for i, (url, note) in enumerate(unfiltered_urls, 1):
             print(f"\n📋 Unfiltered Search {i}/{len(unfiltered_urls)}: {note or 'General'}")
-            roles = scrape_url(url, check_keywords=False, show_details=show_details)
+            roles, first_job = scrape_url(url, check_keywords=False, show_details=show_details)
             all_roles.extend(roles)
+            if first_job:
+                stop_markers[url] = first_job
             if i < len(unfiltered_urls):
                 time.sleep(5)
 
@@ -467,17 +482,20 @@ def get_recent_roles(show_details=False):
     filtered_urls = parse_multiline_urls(LINKEDIN_URLS_FILTERED)
     if filtered_urls:
         for i, (url, note) in enumerate(filtered_urls, 1):
-            print(f"\n🔍 Filtered Search {i}/{len(filtered_urls)}: {note or 'Marketing Keywords'}")
-            roles = scrape_url(url, check_keywords=True, show_details=show_details)
+            print(f"\n🔍 Filtered Search {i}/{len(filtered_urls)}: {note or 'Keywords'}")
+            roles, first_job = scrape_url(url, check_keywords=True, show_details=show_details)
             all_roles.extend(roles)
+            if first_job:
+                stop_markers[url] = first_job
             if i < len(filtered_urls):
                 time.sleep(5)
 
     print("\n" + "="*60)
     print(f"✓ Search Complete: {len(all_roles)} total jobs found")
     print("="*60 + "\n")
-    return all_roles
+    return all_roles, stop_markers
 
 if __name__ == '__main__':
     show_details_arg = os.getenv('SHOW_DETAILED_LOGS', 'False').lower() == 'true'
-    get_recent_roles(show_details=show_details_arg)
+    roles, markers = get_recent_roles(show_details=show_details_arg)
+    print(f"\nStop markers for next run: {len(markers)} URLs tracked")
